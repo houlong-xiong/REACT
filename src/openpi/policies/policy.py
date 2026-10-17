@@ -15,6 +15,7 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.models_pytorch import pi0_pytorch as _pi0_pytorch
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -105,6 +106,59 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    # REACT helpers (PyTorch only). The rolling buffer and scheduling live in `openpi.react`; these methods only
+    # move data between the robot format and the model space (normalized, padded actions).
+
+    @property
+    def react_layout(self) -> dict[str, Any]:
+        """Rolling-buffer layout of a REACT model: num_blocks (K), block_size (S), action_dim and device."""
+        self._check_react()
+        config = self._model.config
+        return {
+            "num_blocks": config.react_num_blocks,
+            "block_size": config.react_block_size,
+            "action_dim": config.action_dim,
+            "device": self._pytorch_device,
+        }
+
+    def react_embed(self, obs: dict) -> _pi0_pytorch.PrefixCache:
+        """Transform `obs` and run the VLM prefix pass. The result conditions `react_denoise`."""
+        self._check_react()
+        inputs = self._input_transform(jax.tree.map(lambda x: x, obs))
+        inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+        return self._model.embed_observation(_model.Observation.from_dict(inputs))
+
+    def react_denoise(self, prefix: _pi0_pytorch.PrefixCache, x_t: torch.Tensor) -> torch.Tensor:
+        """Apply one REACT update (a single Euler step) to the model-space rolling buffer `x_t`."""
+        self._check_react()
+        return self._model.react_denoise_step(prefix, x_t)
+
+    def react_decode(self, actions: torch.Tensor, prefix: _pi0_pytorch.PrefixCache) -> dict:
+        """Convert model-space `actions` (1, n, action_dim) to the robot format with the output transforms.
+
+        The state of the observation behind `prefix` is used by state-dependent transforms (e.g. delta actions).
+        """
+        outputs = {"state": prefix.state, "actions": actions}
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+        return self._output_transform(outputs)
+
+    def react_encode_actions(self, obs: dict) -> torch.Tensor:
+        """Convert the raw action chunk contained in `obs` to model space, shape (1, action_horizon, action_dim).
+
+        `obs` must contain the action keys expected by the input transforms (e.g. "actions"). REACT uses this to
+        initialize the rolling buffer from the robot's reset pose.
+        """
+        inputs = self._input_transform(jax.tree.map(lambda x: x, obs))
+        if "actions" not in inputs:
+            raise ValueError("The input transforms did not produce 'actions'; add the raw action keys to `obs`.")
+        return torch.from_numpy(np.asarray(inputs["actions"], dtype=np.float32)).to(self._pytorch_device)[None, ...]
+
+    def _check_react(self) -> None:
+        if not self._is_pytorch_model:
+            raise NotImplementedError("REACT inference is only supported for PyTorch models.")
+        if not getattr(self._model.config, "react_enabled", False):
+            raise ValueError("The model was not trained with REACT (react_enabled=False).")
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
@@ -133,3 +187,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    @override
+    def reset(self) -> None:
+        self._policy.reset()

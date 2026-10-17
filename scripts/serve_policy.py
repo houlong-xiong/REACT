@@ -2,11 +2,15 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Literal
 
 import tyro
 
+from openpi.policies import acone_policy
+from openpi.policies import franka_policy
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
+from openpi.react import rolling as _react
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
@@ -54,6 +58,21 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # REACT checkpoints (`react_enabled` in the model config) are served with rolling inference: every request
+    # returns the next block of S actions. Initial buffer: the reset pose ("hold") or pure noise ("noise").
+    react_warmup: Literal["hold", "noise"] = "hold"
+    # How the reset pose is read from the observation for the "hold" warm-up: from "state" (ALOHA / RoboTwin
+    # layout), or from the Acone / Franka observation keys.
+    react_hold: Literal["state", "acone", "franka"] = "state"
+
+
+# Reset-pose readers for the REACT warm-up, see `Args.react_hold`.
+REACT_HOLD_ACTIONS: dict[str, _react.HoldActionsFn] = {
+    "state": _react.hold_state_actions,
+    "acone": acone_policy.react_hold_actions,
+    "franka": franka_policy.react_hold_actions,
+}
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -98,6 +117,12 @@ def create_policy(args: Args) -> _policy.Policy:
 
 def main(args: Args) -> None:
     policy = create_policy(args)
+    model_config = _config.get_config(args.policy.config).model if isinstance(args.policy, Checkpoint) else None
+    if getattr(model_config, "react_enabled", False):
+        policy = _react.ReactPolicy(
+            policy, warmup=args.react_warmup, hold_actions_fn=REACT_HOLD_ACTIONS[args.react_hold]
+        )
+        logging.info("Serving REACT rolling inference (block size %d)", policy.block_size)
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.

@@ -49,6 +49,8 @@ class WebsocketPolicyServer:
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
 
+        # Stateful policies (e.g. REACT's rolling buffer) start a new episode for every connection.
+        self._policy.reset()
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None

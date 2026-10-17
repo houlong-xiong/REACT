@@ -34,6 +34,15 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # REACT (rolling denoising, PyTorch only). The action horizon is split into `react_num_blocks` (K) blocks of
+    # `react_block_size` (S = action_horizon / K) actions. Training noises block k to the deterministic flow time
+    # (k + 1) / K (staircase training); inference keeps a rolling buffer with the same schedule and performs a single
+    # Euler step per control update. See `docs/react.md`.
+    react_enabled: bool = False
+    react_num_blocks: int = 5
+    # If true, action tokens use block-causal attention: block k attends only to blocks 0..k.
+    react_block_causal_mask: bool = False
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -46,6 +55,21 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.react_enabled:
+            if self.react_num_blocks < 2:
+                raise ValueError(f"react_num_blocks must be at least 2, got {self.react_num_blocks}.")
+            if self.action_horizon % self.react_num_blocks != 0:
+                raise ValueError(
+                    f"action_horizon ({self.action_horizon}) must be divisible by "
+                    f"react_num_blocks ({self.react_num_blocks})."
+                )
+        elif self.react_block_causal_mask:
+            raise ValueError("react_block_causal_mask requires react_enabled=True.")
+
+    @property
+    def react_block_size(self) -> int:
+        """Number of actions per REACT block (S)."""
+        return self.action_horizon // self.react_num_blocks
 
     @property
     @override
@@ -58,6 +82,8 @@ class Pi0Config(_model.BaseModelConfig):
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
         from openpi.models.pi0 import Pi0
 
+        if self.react_enabled:
+            raise NotImplementedError("REACT is only implemented for the PyTorch model (scripts/train_pytorch.py).")
         return Pi0(self, rngs=nnx.Rngs(rng))
 
     @override

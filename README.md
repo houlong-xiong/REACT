@@ -1,5 +1,7 @@
 # openpi
 
+> **REACT.** This fork adds REACT (*Rolling Denoising and Dual Decoupling for Reactive Robot Control with VLA Models*, CoRL 2026) to the PyTorch π₀ / π₀.₅ models: staircase training, single-step rolling-buffer inference, and Dual Decoupling for asynchronous deployment. See [docs/react.md](docs/react.md).
+
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
 Currently, this repo contains three types of models:

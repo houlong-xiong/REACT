@@ -17,8 +17,10 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.acone_policy as acone_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.franka_policy as franka_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -352,6 +354,116 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAconeDataConfig(DataConfigFactory):
+    """Acone / ARX X5 bimanual robot: two 6-DoF arms with grippers, top and two wrist cameras.
+
+    See `acone_policy.py` for the expected keys.
+    """
+
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.camera_top": "observation.images.camera_top",
+                        "observation.images.camera_wrist_left": "observation.images.camera_wrist_left",
+                        "observation.images.camera_wrist_right": "observation.images.camera_wrist_right",
+                        "observation.state.arm.position": "observation.state.arm.position",
+                        "observation.state.effector.position": "observation.state.effector.position",
+                        "action.arm.position": "action.arm.position",
+                        "action.effector.position": "action.effector.position",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[acone_policy.AconeInputs(model_type=model_config.model_type)],
+            outputs=[acone_policy.AconeOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            # [left arm (6), left gripper, right arm (6), right gripper]
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action.arm.position", "action.effector.position"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaDataConfig(DataConfigFactory):
+    """Dual-arm Franka Research 3 with end-effector control, top and two wrist cameras.
+
+    See `franka_policy.py` for the expected keys.
+    """
+
+    # If true, will convert end-effector dimensions to deltas with respect to the current state before passing to
+    # the model. Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # End-effector dimensions per arm (x, y, z and sin/cos of roll, pitch, yaw).
+    arm_dof: int = 9
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.camera_top": "observation.images.camera_top",
+                        "observation.images.camera_wrist_left": "observation.images.camera_wrist_left",
+                        "observation.images.camera_wrist_right": "observation.images.camera_wrist_right",
+                        "observation.state.end.position": "observation.state.end.position",
+                        "observation.state.effector.position": "observation.state.effector.position",
+                        "action.end.position": "action.end.position",
+                        "action.effector.position": "action.effector.position",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[franka_policy.FrankaInputs(model_type=model_config.model_type)],
+            outputs=[franka_policy.FrankaOutputs(action_dim=2 * self.arm_dof + 2)],
+        )
+        if self.use_delta_joint_actions:
+            # [left ee, left gripper, right ee, right gripper]
+            delta_action_mask = _transforms.make_bool_mask(self.arm_dof, -1, self.arm_dof, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action.end.position", "action.effector.position"),
         )
 
 
@@ -931,6 +1043,76 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     #
+    # REACT configs (PyTorch only, see docs/react.md). pi0.5 base weights must first be converted to PyTorch with
+    # examples/convert_jax_model_to_pytorch.py; point `pytorch_weight_path` at the result. All configs use K = 5
+    # blocks of S = 10 actions (H = 50) and a cosine schedule with 10% warmup.
+    #
+    # RoboTwin 2.0 / ALOHA-format data (simulation in the paper: batch 32, 30k steps).
+    TrainConfig(
+        name="pi05_react_aloha",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, react_enabled=True, react_num_blocks=5),
+        data=LeRobotAlohaDataConfig(
+            repo_id="your_hf_username/your_robotwin_dataset",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000, peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        pytorch_weight_path="/path/to/pi05_base_pytorch",
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    # Acone / ARX X5 (real robot in the paper: batch 128, 20 epochs). Set `num_train_steps` and the schedule to
+    # about 20 * num_frames / batch_size for your dataset.
+    TrainConfig(
+        name="pi05_react_acone",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, react_enabled=True, react_num_blocks=5),
+        data=LeRobotAconeDataConfig(
+            repo_id="your_hf_username/your_acone_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000, peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        pytorch_weight_path="/path/to/pi05_base_pytorch",
+        batch_size=128,
+        num_train_steps=30_000,
+    ),
+    # Dual-arm Franka Research 3 with end-effector actions (real robot in the paper: batch 256, 20 epochs).
+    TrainConfig(
+        name="pi05_react_franka",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, react_enabled=True, react_num_blocks=5),
+        data=LeRobotFrankaDataConfig(
+            repo_id="your_hf_username/your_franka_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000, peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        pytorch_weight_path="/path/to/pi05_base_pytorch",
+        batch_size=256,
+        num_train_steps=30_000,
+    ),
+    #
     # Debugging configs.
     #
     TrainConfig(
@@ -963,6 +1145,23 @@ _CONFIGS = [
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_pi05_react",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_horizon=10,
+            react_enabled=True,
+            react_num_blocks=5,
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_pi05_react",
         wandb_enabled=False,
     ),
     # RoboArena & PolaRiS configs.

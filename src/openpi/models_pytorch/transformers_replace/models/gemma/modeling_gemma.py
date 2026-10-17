@@ -86,8 +86,9 @@ class GemmaRMSNorm(nn.Module):
         
         #self.dense.to(dtype=torch.bfloat16).to(dtype=torch.float32)
         modulation = self.dense(cond)
-        # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features]
-        if len(x.shape) == 3:  # [batch, seq, features]
+        # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features].
+        # A 3D cond [batch, seq, cond_dim] (per-position conditioning, used by REACT) already broadcasts.
+        if len(x.shape) == 3 and len(modulation.shape) == 2:  # [batch, seq, features]
             modulation = modulation.unsqueeze(1)
         
         scale, shift, gate = torch.chunk(modulation, 3, dim=-1)

@@ -1,5 +1,6 @@
 import logging
 import math
+from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor
@@ -25,12 +26,15 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Computes sine-cosine positional embedding vectors for scalar positions.
+
+    `time` is either `(batch_size,)` or, for per-position times (REACT), `(batch_size, seq_len)`.
+    """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor is expected to be of shape `(batch_size,)` or `(batch_size, seq_len)`.")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -38,8 +42,8 @@ def create_sinusoidal_pos_embedding(
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = time[..., None] * scaling_factor
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):
@@ -81,6 +85,14 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks & pad_2d_masks
 
 
+class PrefixCache(NamedTuple):
+    """Key/value cache of the VLM prefix (images + language) for one observation, reused by the action expert."""
+
+    past_key_values: Any
+    prefix_pad_masks: Tensor
+    state: Tensor
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -111,6 +123,11 @@ class PI0Pytorch(nn.Module):
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+            if config.react_enabled:
+                # REACT runs the VLM prefix and the action-expert update separately (Dual Decoupling runs them in
+                # different processes), so both are compiled on their own.
+                self.embed_observation = torch.compile(self.embed_observation, mode=config.pytorch_compile_mode)
+                self.react_denoise_step = torch.compile(self.react_denoise_step, mode=config.pytorch_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -184,6 +201,16 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def react_time(self, bsize, device):
+        """REACT staircase flow times tau_j = (floor(j / S) + 1) / K, shape (bsize, action_horizon).
+
+        Block 0 (closest to execution) is at 1/K and the last block is pure noise (tau = 1). Training and rolling
+        inference use the same schedule.
+        """
+        block_index = torch.arange(self.config.action_horizon, device=device) // self.config.react_block_size
+        time = (block_index + 1).to(torch.float32) / self.config.react_num_blocks
+        return time[None, :].expand(bsize, -1)
+
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -236,7 +263,10 @@ class PI0Pytorch(nn.Module):
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        `timestep` is `(batch_size,)`, or `(batch_size, action_horizon)` for per-position flow times (REACT).
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -274,7 +304,8 @@ class PI0Pytorch(nn.Module):
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            if time_emb.ndim == 2:
+                time_emb = time_emb[:, None, :].expand_as(action_emb)
             action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
             # Apply MLP layers
@@ -286,7 +317,7 @@ class PI0Pytorch(nn.Module):
             action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
             adarms_cond = None
         else:
-            # time MLP (for adaRMS)
+            # time MLP (for adaRMS). With per-position times the conditioning is per action token.
             def time_mlp_func(time_emb):
                 x = self.time_mlp_in(time_emb)
                 x = F.silu(x)  # swish == silu
@@ -305,7 +336,12 @@ class PI0Pytorch(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+        if self.config.react_block_causal_mask:
+            # Block-causal attention between REACT blocks: block k attends only to blocks 0..k.
+            block_size = self.config.react_block_size
+            att_masks += ([1] + [0] * (block_size - 1)) * self.config.react_num_blocks
+        else:
+            att_masks += [1] + ([0] * (self.config.action_horizon - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -315,16 +351,24 @@ class PI0Pytorch(nn.Module):
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)
+
+        With `react_enabled`, every sample is noised with the deterministic REACT staircase (see `react_time`), so
+        one forward pass supervises all K denoising stages used by rolling inference.
+        """
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            if self.config.react_enabled:
+                time = self.react_time(actions.shape[0], actions.device)
+            else:
+                time = self.sample_time(actions.shape[0], actions.device)
 
-        time_expanded = time[:, None, None]
+        # Per-position times have shape (batch_size, action_horizon).
+        time_expanded = time[:, :, None] if time.ndim == 2 else time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -374,13 +418,8 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
+    def embed_observation(self, observation) -> PrefixCache:
+        """Run the VLM on the prefix (images + language) and cache its keys/values for the action expert."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
@@ -398,6 +437,17 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        return PrefixCache(past_key_values=past_key_values, prefix_pad_masks=prefix_pad_masks, state=state)
+
+    @torch.no_grad()
+    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix = self.embed_observation(observation)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -407,9 +457,9 @@ class PI0Pytorch(nn.Module):
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
+                prefix.state,
+                prefix.prefix_pad_masks,
+                prefix.past_key_values,
                 x_t,
                 expanded_time,
             )
@@ -418,6 +468,17 @@ class PI0Pytorch(nn.Module):
             x_t = x_t + dt * v_t
             time += dt
         return x_t
+
+    @torch.no_grad()
+    def react_denoise_step(self, prefix: PrefixCache, x_t: Tensor) -> Tensor:
+        """One REACT update: a single Euler step of size 1/K on the rolling buffer `x_t`.
+
+        `x_t` (batch_size, action_horizon, action_dim) holds the K blocks at the staircase times of `react_time`.
+        After the step, block 0 is clean (tau = 0) and every other block has moved one stage toward execution.
+        """
+        time = self.react_time(x_t.shape[0], x_t.device)
+        v_t = self.denoise_step(prefix.state, prefix.prefix_pad_masks, prefix.past_key_values, x_t, time)
+        return x_t - v_t / self.config.react_num_blocks
 
     def denoise_step(
         self,
